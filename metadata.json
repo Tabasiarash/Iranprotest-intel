@@ -1,0 +1,5 @@
+{
+  "name": "Iran Intel",
+  "description": "A geospatial intelligence tool to map and archive events from Telegram channels using AI for extraction and categorization.",
+  "requestFramePermissions": []
+}
