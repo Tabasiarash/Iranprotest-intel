@@ -1,65 +1,9 @@
-import { GoogleGenAI, GenerateContentResponse, Chat } from "@google/genai";
-import { IntelEvent, SourceType, AppLanguage, ScannedPost } from '../types';
+
+import { GoogleGenAI, Type, GenerateContentResponse } from "@google/genai";
+import { IntelEvent, EventCategory, SourceType, AppLanguage, Casualties, IndividualCasualty, ScannedPost, SecurityCasualties, CVInsight } from '../types';
 import { v4 as uuidv4 } from 'uuid';
 
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
-
-// --- QUOTA & CACHE SYSTEM ---
-const QUOTA_KEY = 'INTEL_QUOTA_V1';
-const VISION_CACHE_KEY = 'INTEL_VISION_CACHE_V1';
-const MAX_GLOBAL_DAILY_VISION = 20;
-const MAX_CHANNEL_DAILY_VISION = 5;
-
-interface QuotaState {
-    date: string;
-    globalCount: number;
-    channelCounts: Record<string, number>;
-}
-
-const QuotaManager = {
-    getState: (): QuotaState => {
-        try {
-            const str = localStorage.getItem(QUOTA_KEY);
-            const data = str ? JSON.parse(str) : null;
-            const today = new Date().toISOString().split('T')[0];
-            if (!data || data.date !== today) {
-                return { date: today, globalCount: 0, channelCounts: {} };
-            }
-            return data;
-        } catch { return { date: new Date().toISOString().split('T')[0], globalCount: 0, channelCounts: {} }; }
-    },
-    canAnalyze: (channelUrl: string): boolean => {
-        const state = QuotaManager.getState();
-        const cleanUrl = channelUrl.split('?')[0];
-        if (state.globalCount >= MAX_GLOBAL_DAILY_VISION) return false;
-        if ((state.channelCounts[cleanUrl] || 0) >= MAX_CHANNEL_DAILY_VISION) return false;
-        return true;
-    },
-    increment: (channelUrl: string) => {
-        const state = QuotaManager.getState();
-        const cleanUrl = channelUrl.split('?')[0];
-        state.globalCount++;
-        state.channelCounts[cleanUrl] = (state.channelCounts[cleanUrl] || 0) + 1;
-        localStorage.setItem(QUOTA_KEY, JSON.stringify(state));
-    }
-};
-
-const VisionCache = {
-    get: (mediaUrl: string) => {
-        try {
-            const cache = JSON.parse(localStorage.getItem(VISION_CACHE_KEY) || '{}');
-            return cache[mediaUrl] || null;
-        } catch { return null; }
-    },
-    set: (mediaUrl: string, result: any) => {
-        try {
-            const cache = JSON.parse(localStorage.getItem(VISION_CACHE_KEY) || '{}');
-            if (Object.keys(cache).length > 500) { localStorage.removeItem(VISION_CACHE_KEY); return; }
-            cache[mediaUrl] = result;
-            localStorage.setItem(VISION_CACHE_KEY, JSON.stringify(cache));
-        } catch {}
-    }
-};
 
 export const isRetryableError = (error: any): boolean => {
     if (!error) return false;
@@ -70,14 +14,15 @@ export const isRetryableError = (error: any): boolean => {
     return false;
 };
 
-async function callWithRetry<T>(fn: () => Promise<T>, retries = 3, initialDelay = 2000): Promise<T> {
+async function callWithRetry<T>(fn: () => Promise<T>, signal?: AbortSignal, retries = 5, initialDelay = 5000): Promise<T> {
     let currentDelay = initialDelay;
     for (let i = 0; i < retries; i++) {
+        if (signal?.aborted) throw new Error("Operation Aborted");
         try {
             return await fn();
         } catch (error: any) {
             if (isRetryableError(error) && i < retries - 1) {
-                console.warn(`[RETRY] Error encountered. Retrying in ${currentDelay}ms...`);
+                console.warn(`[RETRY] Sequential Sync: Throttling request. Retrying in ${currentDelay}ms...`);
                 await sleep(currentDelay);
                 currentDelay *= 1.5; 
                 continue;
@@ -85,7 +30,7 @@ async function callWithRetry<T>(fn: () => Promise<T>, retries = 3, initialDelay 
             throw error;
         }
     }
-    throw new Error("Max retries exceeded");
+    throw new Error("Sequential pipeline failed after retries");
 }
 
 function repairTruncatedJson(json: string): any {
@@ -104,8 +49,8 @@ function repairTruncatedJson(json: string): any {
 
 async function fetchWithProxyFallback(targetUrl: string): Promise<string> {
     const proxies = [
-        { name: 'AllOrigins', getUrl: (u: string) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, isJson: true },
-        { name: 'CorsProxy', getUrl: (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}` }
+        { name: 'CorsProxy', getUrl: (u: string) => `https://corsproxy.io/?${encodeURIComponent(u)}` },
+        { name: 'AllOrigins', getUrl: (u: string) => `https://api.allorigins.win/get?url=${encodeURIComponent(u)}`, isJson: true }
     ];
     for (const proxy of proxies) {
         try {
@@ -115,15 +60,14 @@ async function fetchWithProxyFallback(targetUrl: string): Promise<string> {
             if (content && content.length > 100) return content;
         } catch (e) {}
     }
-    throw new Error("Source unreachable");
+    throw new Error("Sequential source uplink offline");
 }
 
 async function getBase64FromUrl(url: string): Promise<{ data: string, mimeType: string } | null> {
     try {
         const proxyUrl = `https://corsproxy.io/?${encodeURIComponent(url)}`;
-        const response = await fetch(proxyUrl);
+        const response = await fetch(proxyUrl, { cache: 'no-store' });
         const blob = await response.blob();
-        if (blob.size > 2 * 1024 * 1024) return null; 
         return new Promise((resolve) => {
             const reader = new FileReader();
             reader.onloadend = () => {
@@ -141,20 +85,18 @@ export interface EnhancedSourcePage {
     type: SourceType;
 }
 
-export const fetchSourceData = async (urlInput: string, minDate?: string, onProgress?: (msg: string) => void): Promise<EnhancedSourcePage> => {
+export const fetchSourceData = async (urlInput: string, maxPages: number = 20, onProgress?: (msg: string) => void, signal?: AbortSignal): Promise<EnhancedSourcePage> => {
   const url = urlInput.trim();
   let type: SourceType = url.includes('t.me/') ? SourceType.TELEGRAM : SourceType.WEB;
   let posts: ScannedPost[] = [];
   let sourceName = url.split('/').pop()?.replace(/\?.*/, '') || "Source";
-  const scanLimitTime = minDate ? new Date(minDate).getTime() : 0;
   
   let currentCursor: string | undefined = undefined;
-  const isYearScan = (Date.now() - scanLimitTime) > (180 * 24 * 60 * 60 * 1000);
-  const MAX_PAGES = isYearScan ? 200 : 50; 
   let pageCount = 0;
-  let reachedDateLimit = false;
 
-  while (pageCount < MAX_PAGES && !reachedDateLimit) {
+  while (pageCount < maxPages) {
+      if (signal?.aborted) throw new Error("Harvest Interrupted");
+      
       let targetUrl = url;
       if (type === SourceType.TELEGRAM) {
           if (!url.includes('/s/')) targetUrl = url.replace('t.me/', 't.me/s/');
@@ -178,9 +120,6 @@ export const fetchSourceData = async (urlInput: string, minDate?: string, onProg
                   if (id) oldestIdOnPage = id;
 
                   if (text && dateStr) {
-                      const postTime = new Date(dateStr).getTime();
-                      if (postTime < scanLimitTime) { reachedDateLimit = true; return; }
-                      
                       const photoNode = node.querySelector('.tgme_widget_message_photo_wrap') as HTMLElement;
                       let mediaUrl: string | undefined = undefined;
                       if (photoNode) {
@@ -188,30 +127,36 @@ export const fetchSourceData = async (urlInput: string, minDate?: string, onProg
                           const match = style.match(/url\(['"]?([^'"]+)['"]?\)/);
                           if (match) mediaUrl = match[1];
                       }
-                      
+
                       posts.push({ id: id || uuidv4(), url: `${url}/${id}`, text, date: dateStr, mediaUrl, mediaType: 'image' });
                   }
               });
-
               if (oldestIdOnPage === currentCursor) break; 
               currentCursor = oldestIdOnPage || undefined;
           } else break;
       } catch (e) { break; }
       
       pageCount++;
-      onProgress?.(`Harvesting archive: Page ${pageCount} fetched (${posts.length} records discovered)...`);
-      if (reachedDateLimit) break;
-      await sleep(400); 
+      onProgress?.(`Historical Scoping: ${posts.length} entries located...`);
+      await sleep(500); 
   }
 
   return { posts, sourceName, type };
 };
 
-export const parseIntelContent = async (allPosts: ScannedPost[], type: SourceType, language: AppLanguage = 'en', regionFocus?: string, onProgress?: (msg: string) => void): Promise<IntelEvent[]> => {
+export const parseIntelContent = async (
+    allPosts: ScannedPost[], 
+    type: SourceType, 
+    language: AppLanguage = 'en', 
+    processedMediaIds: string[] = [],
+    region: string = "Iran",
+    onProgress?: (msg: string) => void, 
+    signal?: AbortSignal
+): Promise<{events: IntelEvent[], newlyAnalyzedMediaIds: string[]}> => {
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const focus = regionFocus && regionFocus !== 'ALL' ? `ONLY extract events in "${regionFocus}".` : "";
+  const newlyAnalyzedMediaIds: string[] = [];
   
-  const CHUNK_SIZE = 40;
+  const CHUNK_SIZE = 15; 
   const chunks: ScannedPost[][] = [];
   for (let i = 0; i < allPosts.length; i += CHUNK_SIZE) {
       chunks.push(allPosts.slice(i, i + CHUNK_SIZE));
@@ -220,198 +165,223 @@ export const parseIntelContent = async (allPosts: ScannedPost[], type: SourceTyp
   let allExtractedEvents: IntelEvent[] = [];
 
   for (let i = 0; i < chunks.length; i++) {
+    if (signal?.aborted) return { events: allExtractedEvents, newlyAnalyzedMediaIds }; 
+    
     const chunk = chunks[i];
-    onProgress?.(`AI Extraction: Analyzing Batch ${i + 1}/${chunks.length} (${allExtractedEvents.length} events logged)...`);
+    onProgress?.(`Victim ID Pipeline: Batch ${i + 1}/${chunks.length}...`);
     
-    const inputContent = chunk.map(p => `[ID:${p.id}][DATE:${p.date}][HAS_IMAGE:${!!p.mediaUrl}] ${p.text}`).join('\n---\n');
-    
+    const inputContent = chunk.map(p => `[ID:${p.id}][DATE:${p.date}] ${p.text}`).join('\n---\n');
     const prompt = `
-      TASK: GEOSPATIAL INTELLIGENCE EXTRACTION
-      TARGET LANGUAGE: FARSI (PERSIAN) - Translate ALL output fields to Farsi.
+      CRITICAL TASK: INDIVIDUAL VICTIM IDENTIFICATION (HISTORICAL SCAN)
+      LANGUAGE: ${language.toUpperCase()}
+      TARGET REGION: ${region}
       
-      PRIORITY:
-      1. VICTIM IDENTIFICATION: Extract names of Killed/Injured/Detained. Link them to the event.
-      2. MEDIA LINKING: If the source text describes a specific victim and has [HAS_IMAGE:true], assume the image belongs to the victim.
-      3. ACCURACY: If source is 'Hengaw', treat casualty numbers and names as high confidence.
-
-      CONTENT:
+      OBJECTIVE: Scrutinize the provided text to identify protestors who were MARTYRED, WOUNDED, or DETAINED. 
+      You MUST extract full names, ages, and specific locations for every unique individual mentioned.
+      Focus on events occurring in ${region}.
+      
+      CROSS-REFERENCE: If multiple posts mention the same person, ensure they are listed in the "individualCasualties" array of the primary event they are linked to.
+      
+      DATA TO ANALYZE:
       ${inputContent}
 
-      INSTRUCTIONS:
-      1. Identify kinetic events, protests, and human rights violations.
-      2. CLASSIFY: Military, Kinetic Clashes, Political, Cyber, Strikes/Economic, Civil Unrest, Humanitarian, Infrastructure.
-      3. EXTRACT INDIVIDUAL CASUALTIES:
-         - Name (Farsi)
-         - Status: 'Killed' | 'Injured' | 'Detained'
-         - Age (if available)
-         - Side: 'Civilian' or 'Security'
-         - Link to Image: If post has image and talks about this person.
-      4. DEDUPLICATION: Merge updates about the same event.
-      5. RETURN JSON ARRAY.
-
-      SCHEMA: [
-        {
-          "title":string (Farsi), "summary":string (Farsi), "category":string, "date":"YYYY-MM-DD", "locationName":string (City, Province), "lat":float, "lng":float, "reliabilityScore":int, "sourceId":string, "protestorCount":int, 
-          "casualties":{"dead":int,"injured":int,"detained":int}, 
-          "securityCasualties":{"dead":int,"injured":int},
-          "individualCasualties": [
-             { "name": string (Farsi), "age": string, "status": "Killed"|"Injured"|"Detained", "side": "Civilian"|"Security", "means": string (Farsi description of cause) }
-          ]
-        }
-      ]
+      SCHEMA: [{
+        "title": string, 
+        "summary": string, 
+        "category": "Civil Unrest" | "Kinetic Clashes" | "Political", 
+        "date": "YYYY-MM-DD", 
+        "locationName": string, 
+        "lat": float, 
+        "lng": float, 
+        "sourceId": string,
+        "individualCasualties": [{
+            "name": string,
+            "status": "Killed" | "Injured" | "Detained",
+            "age": string,
+            "location": string,
+            "means": string,
+            "description": string,
+            "side": "Civilian"
+        }]
+      }]
     `;
 
     try {
       const response: GenerateContentResponse = await callWithRetry(() => ai.models.generateContent({
         model: 'gemini-3-flash-preview',
         contents: prompt,
-        config: { responseMimeType: "application/json", thinkingConfig: { thinkingBudget: 2000 } }
-      }));
+        config: { responseMimeType: "application/json" }
+      }), signal);
 
       const parsed = repairTruncatedJson(response.text || "[]");
       if (Array.isArray(parsed)) {
-          const eventsInChunk = parsed
-            .filter((item: any) => item && typeof item === 'object')
-            .map((item: any) => {
-            const parentPost = chunk.find(p => p.id === item.sourceId);
-            let finalIndividuals = item.individualCasualties || [];
-            const casualtySourceUrl = parentPost ? parentPost.url : (allPosts[0]?.url || '');
-            
-            // Intelligent Image Linking
-            if (parentPost?.mediaUrl && finalIndividuals.length > 0) {
-               // If post has 1 image and victims listed, assign image to them
-               finalIndividuals = finalIndividuals.map((ic: any) => ({
-                   ...ic,
-                   id: uuidv4(),
-                   imageUrl: parentPost.mediaUrl,
-                   sourceUrl: casualtySourceUrl
-               }));
-            } else {
-               finalIndividuals = finalIndividuals.map((ic: any) => ({ 
-                   ...ic, 
-                   id: uuidv4(),
-                   sourceUrl: casualtySourceUrl
-               }));
-            }
+          const eventsInChunk = parsed.map((item: any) => {
+            const baseUrl = allPosts[0]?.url.split('/').slice(0, -1).join('/').replace('/s/', '/');
+            const deaths = (item.individualCasualties || []).filter((ic:any) => ic.status === 'Killed').length;
+            const wounds = (item.individualCasualties || []).filter((ic:any) => ic.status === 'Injured').length;
+            const detains = (item.individualCasualties || []).filter((ic:any) => ic.status === 'Detained').length;
 
             return {
-                ...item,
-                id: uuidv4(),
-                sourceType: type,
-                sourceUrl: allPosts[0]?.url.split('/').slice(0, -1).join('/'),
-                individualCasualties: finalIndividuals
+              ...item,
+              id: uuidv4(),
+              validationScore: 1,
+              approvedSourceUrls: [baseUrl],
+              casualties: { dead: deaths, injured: wounds, detained: detains },
+              securityCasualties: { dead: 0, injured: 0 },
+              individualCasualties: (item.individualCasualties || []).map((ic: any) => ({ 
+                  ...ic, 
+                  id: uuidv4(), 
+                  date: item.date, 
+                  sourceUrl: `${baseUrl}/${item.sourceId}`,
+                  validationScore: 1
+              })),
+              sourceType: type,
+              sourceUrl: baseUrl
             };
           });
           allExtractedEvents.push(...eventsInChunk);
       }
-    } catch (e) { console.error(`Batch ${i} failed`, e); }
+    } catch (e) { console.error(`Victim sync failure`, e); }
+    await sleep(1500);
   }
 
-  // Vision analysis section remains same but ensures language consistency
-  const mediaPosts = allPosts.filter(p => p.mediaUrl);
-  const breakingKeywords = /breaking|urgent|fouri|attack|explosion|massive|killed|shot|clash|کشته|فوری|انفجار/i;
+  const mediaToAnalyze = allPosts.filter(p => p.mediaUrl && !processedMediaIds.includes(p.id)).slice(0, 20); 
   
-  const highValueCandidates = allExtractedEvents.filter(e => {
-      if (!e) return false;
-      const hasMedia = mediaPosts.some(p => p.id === e.sourceId);
-      if (!hasMedia) return false;
-      const isBreaking = breakingKeywords.test(e.title || '') || breakingKeywords.test(e.summary || '');
-      const hasCasualties = (e.casualties?.dead || 0) > 0 || (e.securityCasualties?.dead || 0) > 0;
-      return isBreaking || hasCasualties;
-  });
-
-  const channelUrl = allPosts[0]?.url || "unknown_source";
-
-  for (const event of highValueCandidates) {
-      if (!QuotaManager.canAnalyze(channelUrl)) break;
-
-      const relatedPost = mediaPosts.find(p => p.id === event.sourceId);
-      if (relatedPost?.mediaUrl) {
-          const cachedResult = VisionCache.get(relatedPost.mediaUrl);
-          if (cachedResult) {
-              event.protestorCount = Math.max(event.protestorCount || 0, cachedResult.refinedCount || 0);
-              event.summary = `${event.summary}\n[تایید هوشمند تصویری]: ${cachedResult.visualEvidence}`;
-              event.isCrowdResult = true;
-              event.reliabilityScore = 10;
-              continue;
-          }
-
-          const mediaData = await getBase64FromUrl(relatedPost.mediaUrl);
-          if (mediaData) {
-              try {
-                  const visionPrompt = `
-                    INTEL ANALYST CV TASK:
-                    Analyze this keyframe from event: "${event.title}".
-                    1. Statistics: Estimate participant count.
-                    2. Description: Detail visible weapons, uniforms, or specific street landmarks.
-                    3. Language: FARSI (PERSIAN).
-                    Return JSON: {"refinedCount": int, "visualEvidence": string, "landmark": string}
-                  `;
-                  const visionRes: GenerateContentResponse = await ai.models.generateContent({
-                      model: 'gemini-3-pro-preview',
-                      contents: { parts: [ { inlineData: mediaData }, { text: visionPrompt } ] },
-                      config: { responseMimeType: "application/json" }
-                  });
-                  QuotaManager.increment(channelUrl);
-                  const refined = repairTruncatedJson(visionRes.text || "{}");
-                  VisionCache.set(relatedPost.mediaUrl, refined);
-
-                  if (refined.refinedCount) {
-                      event.protestorCount = Math.max(event.protestorCount || 0, refined.refinedCount);
-                      event.summary = `${event.summary}\n[تایید هوشمند تصویری]: ${refined.visualEvidence}`;
-                      event.isCrowdResult = true;
-                      event.reliabilityScore = 10;
-                  }
-              } catch (vErr) { if (isRetryableError(vErr)) break; }
-          }
-      }
+  if (mediaToAnalyze.length > 0) {
+    onProgress?.(`Forensic Vision: Confirming Victim Identities...`);
+    for (const post of mediaToAnalyze) {
+        if (signal?.aborted) break;
+        const mediaData = await getBase64FromUrl(post.mediaUrl!);
+        if (mediaData) {
+            try {
+                const visionPrompt = `Identify the individual in this image if it's a victim of state violence in ${region}. Return name, age, and burial details if visible via text on posters. JSON: {"name": string, "age": string, "location": string, "status": "Killed"|"Injured"}`;
+                const visionRes: GenerateContentResponse = await callWithRetry(() => ai.models.generateContent({
+                    model: 'gemini-3-pro-preview',
+                    contents: { parts: [ { inlineData: mediaData }, { text: visionPrompt } ] },
+                    config: { responseMimeType: "application/json" }
+                }), signal);
+                const refined = repairTruncatedJson(visionRes.text || "{}");
+                if (refined.name) {
+                    const event = allExtractedEvents.find(e => e.sourceId === post.id);
+                    if (event) {
+                        if (!event.individualCasualties) event.individualCasualties = [];
+                        event.individualCasualties.push({
+                            id: uuidv4(),
+                            name: refined.name,
+                            status: refined.status || 'Killed',
+                            age: refined.age,
+                            location: refined.location || event.locationName,
+                            side: 'Civilian',
+                            date: event.date,
+                            imageUrl: post.mediaUrl,
+                            validationScore: 2 
+                        });
+                        event.isCrowdResult = true;
+                    }
+                }
+                newlyAnalyzedMediaIds.push(post.id);
+            } catch (vErr) {}
+            await sleep(2500);
+        }
+    }
   }
 
-  return allExtractedEvents;
+  return { events: allExtractedEvents, newlyAnalyzedMediaIds };
 };
 
-// ... (Rest of file unchanged)
-export const correctIntelStats = async (event: IntelEvent, language: AppLanguage): Promise<Partial<IntelEvent>> => {
+export const synthesizeCasualtyClaims = async (eventTitle: string, clusterReports: any[], language: AppLanguage): Promise<{casualties: Casualties, securityCasualties: SecurityCasualties, validationScore: number}> => {
+  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+  const context = clusterReports.map(r => `[Source: ${r.source}] Reported Dead: ${r.dead}, Injured: ${r.injured}, Detained: ${r.detained}`).join('\n');
+  const prompt = `Synthesize multi-channel claims for "${eventTitle}". Resolve discrepancies. JSON: {"casualties": {"dead":int, "injured":int, "detained":int}, "validationScore": int}`;
+
+  try {
+      const response = await ai.models.generateContent({
+          model: 'gemini-3-flash-preview',
+          contents: prompt,
+          config: { responseMimeType: "application/json" }
+      });
+      const parsed = repairTruncatedJson(response.text || "{}");
+      return {
+          casualties: parsed.casualties || { dead: 0, injured: 0, detained: 0 },
+          securityCasualties: { dead: 0, injured: 0 },
+          validationScore: parsed.validationScore || clusterReports.length
+      };
+  } catch (e) {
+      return {
+          casualties: { dead: 0, injured: 0, detained: 0 },
+          securityCasualties: { dead: 0, injured: 0 },
+          validationScore: clusterReports.length
+      };
+  }
+};
+
+export const correctIntelStats = async (event: IntelEvent, language: AppLanguage): Promise<IntelEvent> => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const prompt = `
-      TASK: STATISTICAL CORRECTION
-      TARGET LANGUAGE: FARSI
-      EVENT: "${event.title}" - "${event.summary}"
-      
-      INSTRUCTIONS:
-      Check if summary mentions "nationwide" vs "local" stats. Correct to local.
-      RETURN JSON: {"casualties":{...}, "securityCasualties":{...}, "reliabilityReason": string}
-    `;
+    const prompt = `Perform forensic audit on "${event.title}". Cross-check victim identities. Return JSON for officialStats and updated validationScore.`;
     try {
-        const response = await callWithRetry(() => ai.models.generateContent({
+        const response = await ai.models.generateContent({
             model: 'gemini-3-pro-preview',
             contents: prompt,
             config: { responseMimeType: "application/json" }
-        }));
-        return repairTruncatedJson(response.text || "{}");
-    } catch (e) { throw e; }
+        });
+        const refined = repairTruncatedJson(response.text || "{}");
+        return { 
+            ...event, 
+            officialStats: refined.officialStats || event.officialStats,
+            validationScore: refined.validationScore || event.validationScore 
+        };
+    } catch (e) { return event; }
+};
+
+export interface IntelligenceInsights {
+    hotspots: string[];
+    riskLevel: 'LOW' | 'ELEVATED' | 'HIGH' | 'CRITICAL';
+    anomalies: string[];
+    strategicTrends: string[];
+    summary: string;
+}
+
+export const generateSituationReport = async (events: IntelEvent[], language: AppLanguage): Promise<{sitrep: string, insights: IntelligenceInsights}> => {
+    const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
+    const context = events.slice(0, 40).map(e => `[${e.date}][VALIDATION:${e.validationScore}] ${e.title}: ${e.summary}`).join('\n\n');
+    const prompt = `ACT AS: Geospatial Intel Director. Synthesize results into a tactical SITREP. Identify cross-channel discrepancies. Language: ${language.toUpperCase()}. Context: ${context}`;
+
+    try {
+        const reportRes = await ai.models.generateContent({
+            model: 'gemini-3-pro-preview',
+            contents: prompt,
+            config: { thinkingConfig: { thinkingBudget: 4000 }, temperature: 0.2 }
+        });
+        const insightPrompt = `Extract structured trends in JSON: {"hotspots":[], "riskLevel":"", "anomalies":[], "strategicTrends":[], "summary":""}`;
+        const insightsRes = await ai.models.generateContent({
+            model: 'gemini-3-flash-preview',
+            contents: insightPrompt,
+            config: { responseMimeType: "application/json" }
+        });
+
+        return {
+            sitrep: reportRes.text || "Report Severed.",
+            insights: repairTruncatedJson(insightsRes.text || "{}")
+        };
+    } catch (e) {
+        return {
+            sitrep: "Neural synthesis offline.",
+            insights: { hotspots: [], riskLevel: 'LOW', anomalies: [], strategicTrends: [], summary: "Analysis failed." }
+        };
+    }
 };
 
 export const chatWithIntel = async (userMessage: string, contextEvents: IntelEvent[], language: AppLanguage, history: {role: 'user' | 'model', text: string}[]): Promise<string> => {
     const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-    const contextData = contextEvents.map(e => `[${e.date}] ${e.title}: ${e.summary}`).join('\n');
-    const systemPrompt = `You are a Geospatial Intel Analyst. Context: ${contextData}. Answer in FARSI. Be analytical.`;
+    const contextData = contextEvents.slice(0, 20).map(e => `[${e.date}][VALIDATION:${e.validationScore}] ${e.title}: ${e.summary}`).join('\n---\n');
+    const systemPrompt = `PERSONA: Victim Identification Analyst. Language: ${language}. Context: ${contextData}`;
     try {
-        const chat: Chat = ai.chats.create({ 
-            model: 'gemini-3-flash-preview', 
-            config: { systemInstruction: systemPrompt }, 
+        const chat = ai.chats.create({ 
+            model: 'gemini-3-pro-preview', 
+            config: { systemInstruction: systemPrompt, temperature: 0.3 }, 
             history: history.map(h => ({ role: h.role, parts: [{ text: h.text }] })) 
         });
-        const result: GenerateContentResponse = await callWithRetry(() => chat.sendMessage({ message: userMessage }));
-        return result.text || "No response.";
-    } catch (e) { return "System offline."; }
-};
-
-export const generateSituationReport = async (events: IntelEvent[], language: AppLanguage): Promise<string> => {
-  const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  const prompt = `Generate a tactical SITREP in FARSI synthesizing these events: ${JSON.stringify(events.slice(0, 50))}. Focus on strategic patterns and casualty separation.`;
-  try {
-      const response: GenerateContentResponse = await ai.models.generateContent({ model: 'gemini-3-flash-preview', contents: prompt });
-      return response.text || "Failed.";
-  } catch (e) { return "Error."; }
+        const result = await chat.sendMessage({ message: userMessage });
+        return result.text || "No linguistic payload.";
+    } catch (e) { return "Linguistic uplink severed."; }
 };

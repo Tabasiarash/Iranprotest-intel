@@ -12,7 +12,8 @@ interface GlobeVisProps {
   language: AppLanguage;
 }
 
-const getCategoryColor = (category: EventCategory): string => {
+// Fix: Allow string to support flexible category matching for data loaded from strings
+const getCategoryColor = (category: EventCategory | string): string => {
   switch (category) {
     case EventCategory.MILITARY: return '#ef4444'; 
     case EventCategory.KINETIC: return '#f97316'; 
@@ -182,7 +183,8 @@ const GlobeVis: React.FC<GlobeVisProps> = ({ events, selectedEventId, onEventCli
                         <Popup offset={[0, -5]} closeButton={false}>
                              <div className={`w-80 font-sans p-1 ${isRtl ? 'text-right' : 'text-left'}`} dir={isRtl ? 'rtl' : 'ltr'}>
                                 <div className="flex justify-between items-start mb-2 border-b border-slate-700/50 pb-2">
-                                    <span className="text-[10px] px-2 py-0.5 rounded font-black uppercase" style={{ backgroundColor: `${categoryColor}40`, color: categoryColor }}>{t.cats[event.category]}</span>
+                                    {/* Fix: Index into t.cats with potentially string-typed category */}
+                                    <span className="text-[10px] px-2 py-0.5 rounded font-black uppercase" style={{ backgroundColor: `${categoryColor}40`, color: categoryColor }}>{(t.cats as any)[event.category] || event.category}</span>
                                     <div className="flex flex-col items-end">
                                         <span className="text-[9px] text-slate-400 font-mono">{event.date}</span>
                                         {event.isCrowdResult && <span className="text-[8px] text-cyan-400 font-black flex items-center gap-1"><Eye size={8}/> {t.visionVerified}</span>}

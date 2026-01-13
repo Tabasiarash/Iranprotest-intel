@@ -33,6 +33,13 @@ export interface SecurityCasualties {
   injured: number;
 }
 
+export interface CVInsight {
+  timestamp: string;
+  type: 'object' | 'ocr' | 'scene' | 'temporal';
+  insight: string;
+  confidence: number;
+}
+
 export interface IndividualCasualty {
   id: string;
   name: string;
@@ -45,6 +52,7 @@ export interface IndividualCasualty {
   location?: string;
   imageUrl?: string;
   sourceUrl?: string;
+  validationScore?: number;
 }
 
 export interface IntelEvent {
@@ -55,38 +63,41 @@ export interface IntelEvent {
   locationName: string;
   lat: number;
   lng: number;
-  category: EventCategory;
-  sourceType: SourceType;
+  category: EventCategory | string;
+  sourceType: SourceType | string;
   sourceName?: string;
   sourceUrl?: string; 
   sourceId?: string; 
   groundingUrls?: string[]; 
   reliabilityScore?: number; 
   reliabilityReason?: string;
-  protestorCount?: number; 
+  protestorCount?: number | null; 
   casualties?: Casualties; 
   securityCasualties?: SecurityCasualties; 
   individualCasualties?: IndividualCasualty[]; 
   isCrowdResult?: boolean;
   visualEvidence?: string;
-}
-
-export interface CrowdAnalysisResult {
-  minEstimate: number;
-  maxEstimate: number;
-  confidence: number;
-  crowdType: string;
-  description: string;
-  hazards?: string;
-  location?: string;
-  lat?: number;
-  lng?: number;
-  date?: string;
+  approvedSourceUrls?: string[];
+  validationScore: number;
+  cvInsights?: CVInsight[];
+  proofCount?: number;
+  visualStats?: {
+    population?: number;
+    casualties?: Casualties;
+    evidenceDescription?: string;
+  };
+  officialStats?: {
+    population?: number;
+    casualties?: Casualties;
+    securityCasualties?: SecurityCasualties;
+  };
 }
 
 export interface ProcessingStatus {
   isProcessing: boolean;
   message: string;
+  currentChannel?: string;
+  progressPercent?: number;
   error?: string;
 }
 
@@ -96,12 +107,15 @@ export interface SyncConfig {
   monitoredChannels: { url: string; type: SourceType }[]; 
   lastSyncTimestamp?: number;
   targetRegion?: string;
+  maxDepth?: number; // User defined depth of scan (number of pages)
 }
 
 export interface ChannelMetadata {
   lastCursor?: string;
   totalEvents: number;
   lastUpdate: string;
+  lastCvSync: string;
+  processedMediaIds: string[];
   type: SourceType;
 }
 
