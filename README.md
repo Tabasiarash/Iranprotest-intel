@@ -1,20 +1,38 @@
 <div align="center">
-<img width="1200" height="475" alt="GHBanner" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
+<img width="1200" alt="Iran Protest Intel" src="https://github.com/user-attachments/assets/0aa67016-6eaf-458a-adb2-6e31a0763ed6" />
 </div>
 
-# Run and deploy your AI Studio app
+# Iran Protest Intel
 
-This contains everything you need to run your app locally.
+Geolocated protest and civil unrest intelligence visualized on a 3D globe. Telegram channel data is parsed by Gemini AI into structured event timelines with situation reports.
 
-View your app in AI Studio: https://ai.studio/apps/drive/1Z2IxyDupWQfHa9pOq1jOdEyINUiNPX0g
+## Features
 
-## Run Locally
+- **Real-Time Intel Feed** — Extracts protest events from Farsi Telegram channels
+- **Globe Visualization** — Leaflet-based 3D globe with event clustering
+- **AI Summaries** — Gemini-generated situation reports for regional developments
+- **Bilingual Interface** — English and Farsi
+- **Offline Cache** — Events persisted in localStorage
 
-**Prerequisites:**  Node.js
+## Tech Stack
 
+- React 18, TypeScript, Vite
+- Leaflet + react-leaflet
+- @google/genai
+- lucide-react
 
-1. Install dependencies:
-   `npm install`
-2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
-3. Run the app:
-   `npm run dev`
+## Getting Started
+
+```bash
+npm install
+# Set GEMINI_API_KEY in .env.local
+npm run dev
+```
+
+## CI
+
+![CI](https://github.com/Tabasiarash/Iranprotest-intel/actions/workflows/ci.yml/badge.svg)
+
+## License
+
+MIT
